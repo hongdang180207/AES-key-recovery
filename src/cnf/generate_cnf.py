@@ -137,71 +137,52 @@ for i in range(10):
     cnfClause = []
     xorClause = []
 
+    # Separate normal CNF clauses and XOR clauses
     for line in allOfIt:
-        if line.find("x") != -1:
+        if line.strip().startswith("x"):
             xorClause.append(line)
-        else:
+        elif not line.startswith("p"):
             cnfClause.append(line)
 
+    # Convert each 3-literal XOR clause into 4 CNF clauses
     for line in xorClause:
-        line = line.replace("x", " ")[:-2]
+        tokens = line.strip().split()
 
-        if line.find(" -") != -1:
-            appo = line.split(" ")
+        # Example: x1 129 -161 0
+        literals = [
+            int(tokens[0][1:]),
+            int(tokens[1]),
+            int(tokens[2])
+        ]
 
-            clause = (
-                " -" + appo[0] + " -" + appo[1]
-                + " " + appo[2] + " 0\n"
+        if len(tokens) != 4 or tokens[3] != "0":
+            raise ValueError(f"Invalid XOR clause: {line}")
+
+        if len(literals) != 3:
+            raise ValueError(f"Expected 3 literals: {line}")
+
+        # XOR = 1: exclude the four even-parity assignments
+        assignments = [
+            (0, 0, 0),
+            (0, 1, 1),
+            (1, 0, 1),
+            (1, 1, 0)
+        ]
+
+        for assignment in assignments:
+            clause = [
+                literal if bit == 0 else -literal
+                for literal, bit in zip(literals, assignment)
+            ]
+
+            cnfClause.append(
+                " ".join(map(str, clause)) + " 0\n"
             )
-            cnfClause.insert(1, clause)
 
-            clause = (
-                " -" + appo[0] + " " + appo[1]
-                + " " + appo[2][1:] + " 0\n"
-            )
-            cnfClause.insert(1, clause)
-
-            clause = (
-                " " + appo[0] + " -" + appo[1]
-                + " " + appo[2][1:] + " 0\n"
-            )
-            cnfClause.insert(1, clause)
-
-            clause = (
-                " " + appo[0] + " " + appo[1]
-                + " " + appo[2] + " 0\n"
-            )
-            cnfClause.insert(1, clause)
-
-        else:
-            appo = line.split(" ")
-
-            clause = (
-                " -" + appo[0] + " -" + appo[1]
-                + " " + appo[2] + " 0\n"
-            )
-            cnfClause.insert(1, clause)
-
-            clause = (
-                " -" + appo[0] + " " + appo[1]
-                + " -" + appo[2] + " 0\n"
-            )
-            cnfClause.insert(1, clause)
-
-            clause = (
-                " " + appo[0] + " -" + appo[1]
-                + " -" + appo[2] + " 0\n"
-            )
-            cnfClause.insert(1, clause)
-
-            clause = (
-                " " + appo[0] + " " + appo[1]
-                + " " + appo[2] + " 0\n"
-            )
-            cnfClause.insert(1, clause)
-
-    cnfClause[0] = (
-    f'p cnf {varcounter - 1} {len(cnfClause) - 1}\n'
+    # Update DIMACS header
+    cnfClause.insert(
+        0,
+        f'p cnf {varcounter - 1} {len(cnfClause)}\n'
     )
 
     f = open(
