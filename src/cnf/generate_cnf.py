@@ -1,207 +1,231 @@
-from sage.crypto.sboxes import AES
+"""Generate reproducible AES-128 key-schedule recovery DIMACS instances.
+
+The default observation pattern matches the thesis experiments: the first 60
+bits of round key 1 and the last 60 bits of round key 10 are known. Both
+standard DIMACS and CryptoMiniSat XOR-CNF encodings are emitted.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
 import random
-import io
-from aeskeyschedule2 import getSchedule
-import os
-import binascii
-from random import randbytes
-from platform import release
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
 
-varcounter = 1
-outfile = "outputXor.cnf"
-kwowbit = 60
+try:
+    from .aeskeyschedule2 import SBOX, key_schedule
+except ImportError:  # direct execution: python src/cnf/generate_cnf.py
+    from aeskeyschedule2 import SBOX, key_schedule
 
 
-def newvars():
-    global varcounter
-    n = [j for j in range(varcounter, varcounter + 32)]
-    varcounter += 32
-    return n
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_STANDARD_DIR = PROJECT_ROOT / "data" / "cnf" / "standard"
+DEFAULT_XOR_DIR = PROJECT_ROOT / "data" / "cnf" / "xor"
+DEFAULT_MANIFEST = PROJECT_ROOT / "data" / "test" / "manifest.json"
 
 
-def AssignRoundKey(Words, KeyValue, KeyRound, Start, End):
-    baseKey = Words[KeyRound * N][0]
-    KeyWords = []
-
-    for w in Words[KeyRound * N:(KeyRound + 1) * N]:
-        KeyWords += w
-
-    for i in range(Start, End):
-        assert baseKey + i == KeyWords[i]
-
-        if KeyValue[i] == '1':
-            Model2.append(f'{baseKey + i} 0')
-        else:
-            Model2.append(f'-{baseKey + i} 0')
+@dataclass
+class AES128CNF:
+    num_vars: int
+    clauses: list[list[int]]
+    xor_equations: list[list[int]]
+    round_key_variables: list[list[int]]
+    observations: dict[str, int]
 
 
-Words = []
-Model = []
-Model2 = []
-
-N = 4
-R = 10
-
-Bcon = [
-    0x01, 0x02, 0x04, 0x08, 0x10,
-    0x20, 0x40, 0x80, 0x1B, 0x36
-]
-Rcon = [''] + [f'{x:08b}' + '0' * 24 for x in Bcon]
-
-
-for i in range((R + 1) * N):
-    if i < N:
-        Words.append(newvars())
-
-    elif i % N == 0:
-        rot = Words[-1][8:] + Words[-1][:8]
-        n1 = newvars()
-        n2 = newvars()
-
-        for j in range(N):
-            Model += (
-                AES.cnf(
-                    xi=rot[j * 8:(j + 1) * 8],
-                    yi=n1[j * 8:(j + 1) * 8],
-                    format='dimacs_headless'
-                ).split('\n')[:-1]
-            )
-
-        for b in range(32):
-            if Rcon[i // N][b] == '1':
-                Model.append(
-                    f'x{Words[-N][b]} {n1[b]} {n2[b]} 0'
-                )
-            else:
-                Model.append(
-                    f'x{Words[-N][b]} {n1[b]} -{n2[b]} 0'
-                )
-
-        Words.append(n2)
-
-    else:
-        n2 = newvars()
-
-        for b in range(32):
-            Model.append(
-                f'x{Words[-N][b]} {Words[-1][b]} -{n2[b]} 0'
-            )
-
-        Words.append(n2)
+def _sbox_clauses(inputs: Sequence[int], outputs: Sequence[int]) -> list[list[int]]:
+    """Encode y = AES_SBOX(x) as 256x8 guarded output clauses."""
+    if len(inputs) != 8 or len(outputs) != 8:
+        raise ValueError("AES S-box encoding needs eight input and output bits")
+    clauses: list[list[int]] = []
+    for value, substituted in enumerate(SBOX):
+        in_bits = [(value >> (7 - bit)) & 1 for bit in range(8)]
+        guard = [var if bit == 0 else -var for var, bit in zip(inputs, in_bits)]
+        for bit_index, var in enumerate(outputs):
+            expected = (substituted >> (7 - bit_index)) & 1
+            clauses.append(guard + [var if expected else -var])
+    return clauses
 
 
-for i in range(10):
-    print("File " + str(i) + " ...")
-    Model2 = []
+def xor_equation_to_cnf(signed_variables: Sequence[int]) -> list[list[int]]:
+    """Encode XOR of signed literals == 1 using the forbidden even parities."""
+    if not signed_variables or len(set(abs(v) for v in signed_variables)) != len(signed_variables):
+        raise ValueError("XOR equation needs distinct nonzero variables")
+    width = len(signed_variables)
+    clauses: list[list[int]] = []
+    for assignment in range(1 << width):
+        # The signed-literal parity is even, so the assignment is forbidden.
+        if assignment.bit_count() & 1:
+            continue
+        clause: list[int] = []
+        for position, signed_var in enumerate(signed_variables):
+            literal_value = (assignment >> position) & 1
+            var_value = literal_value ^ (signed_var < 0)
+            variable = abs(signed_var)
+            clause.append(variable if var_value == 0 else -variable)
+        clauses.append(clause)
+    return clauses
 
-    Bytekey = randbytes(16)
-    keyschedule = getSchedule(0, Bytekey)
 
-    Bkey = bin(int(keyschedule[0], 16))[2:]
-    Bkey = Bkey.zfill(128)
+def generate_aes128_cnf(
+    key: bytes,
+    *,
+    round1_known_bits: int = 60,
+    round10_known_bits: int = 60,
+) -> AES128CNF:
+    """Build schedule constraints and the thesis-style known-bit units."""
+    if len(key) != 16:
+        raise ValueError("The recovery generator currently supports AES-128 keys only")
+    if not 0 <= round1_known_bits <= 128 or not 0 <= round10_known_bits <= 128:
+        raise ValueError("Known-bit counts must be in 0..128")
 
-    Bkey1 = bin(int(keyschedule[1], 16))[2:]
-    Bkey1 = Bkey1.zfill(128)
+    next_var = 1
+    round_key_variables: list[list[int]] = [list(range(1, 129))]
+    next_var = 129
+    clauses: list[list[int]] = []
+    xor_equations: list[list[int]] = []
+    round_keys = key_schedule(key)
 
-    Bkey10 = bin(int(keyschedule[10], 16))[2:]
-    Bkey10 = Bkey10.zfill(128)
+    for round_index in range(1, 11):
+        # Preserve the thesis variable layout: a 32-bit SubWord output is
+        # allocated before the 128-bit round key (e.g. round 1 starts at 161).
+        sbox_result = list(range(next_var, next_var + 32))
+        next_var += 32
+        this_round_vars = list(range(next_var, next_var + 128))
+        next_var += 128
+        round_key_variables.append(this_round_vars)
 
-    AssignRoundKey(Words, Bkey1, 1, 0, kwowbit)
-    AssignRoundKey(Words, Bkey10, 10, 128 - kwowbit, 128)
+        previous = round_key_variables[round_index - 1]
+        # RotWord on the last word: byte order [1,2,3,0], MSB-first per byte.
+        last_word = previous[96:128]
+        rotated = last_word[8:16] + last_word[16:24] + last_word[24:32] + last_word[0:8]
+        for byte_index in range(4):
+            clauses.extend(_sbox_clauses(rotated[byte_index*8:(byte_index+1)*8],
+                                         sbox_result[byte_index*8:(byte_index+1)*8]))
 
-    f = open(
-        "test/" + str(i) + outfile,
-        'w',
-        encoding='utf-8'
-    )
-    f.write(
-        f'p cnf {varcounter - 1} {len(Model) + len(Model2)}\n'
-    )
+        # AES Rcon uses the standard sequence 01,02,04,08,10,20,40,80,1B,36.
+        rcon_values = (0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36)
+        rcon_word = rcon_values[round_index - 1] << 24
 
-    for c in Model:
-        f.write(c + '\n')
+        for bit_index in range(32):
+            a = previous[bit_index]
+            b = sbox_result[bit_index]
+            out = this_round_vars[bit_index]
+            constant = (rcon_word >> (31 - bit_index)) & 1
+            # a XOR b XOR out = Rcon_bit, represented as XOR(signed lits)=1.
+            xor_equations.append([a, b, out] if constant else [a, b, -out])
 
-    for c in Model2:
-        f.write(c + '\n')
+        for word_index in range(1, 4):
+            for bit_index in range(32):
+                a = previous[word_index * 32 + bit_index]
+                b = this_round_vars[(word_index - 1) * 32 + bit_index]
+                out = this_round_vars[word_index * 32 + bit_index]
+                xor_equations.append([a, b, -out])
 
-    f.close()
+    # Add the thesis image observations to round keys 1 and 10.
+    observations: dict[str, int] = {}
+    for round_index, bit_indices in (
+        (1, range(round1_known_bits)),
+        (10, range(128 - round10_known_bits, 128)),
+    ):
+        for bit_index in bit_indices:
+            variable = round_key_variables[round_index][bit_index]
+            bit_value = int(f"{int.from_bytes(round_keys[round_index], 'big'):0128b}"[bit_index])
+            clauses.append([variable if bit_value else -variable])
+            observations[f"r{round_index}_b{bit_index}"] = bit_value
 
-    f = io.open(
-    "test/" + str(i) + outfile,
-    "r",
-    newline='\n'
-    )
-    allOfIt = f.readlines()
-    f.close()
+    # All generated variables have a role; each round uses 32 S-box temporary
+    # bits and 128 output bits, producing the original 1728-variable layout.
+    return AES128CNF(next_var - 1, clauses, xor_equations,
+                     round_key_variables, observations)
 
-    cnfClause = []
-    xorClause = []
 
-    # Separate normal CNF clauses and XOR clauses
-    for line in allOfIt:
-        if line.strip().startswith("x"):
-            xorClause.append(line)
-        elif not line.startswith("p"):
-            cnfClause.append(line)
+def _standard_clauses(instance: AES128CNF) -> list[list[int]]:
+    result = list(instance.clauses)
+    for equation in instance.xor_equations:
+        result.extend(xor_equation_to_cnf(equation))
+    return result
 
-    # Convert each 3-literal XOR clause into 4 CNF clauses
-    for line in xorClause:
-        tokens = line.strip().split()
 
-        # Example: x1 129 -161 0
-        literals = [
-            int(tokens[0][1:]),
-            int(tokens[1]),
-            int(tokens[2])
-        ]
+def write_dimacs(path: str | Path, num_vars: int, clauses: Iterable[Sequence[int]]) -> None:
+    clauses = [list(clause) for clause in clauses]
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="ascii", newline="\n") as stream:
+        stream.write(f"p cnf {num_vars} {len(clauses)}\n")
+        for clause in clauses:
+            stream.write(" ".join(map(str, clause)) + " 0\n")
 
-        if len(tokens) != 4 or tokens[3] != "0":
-            raise ValueError(f"Invalid XOR clause: {line}")
 
-        if len(literals) != 3:
-            raise ValueError(f"Expected 3 literals: {line}")
+def write_xcnf(path: str | Path, num_vars: int, clauses: Iterable[Sequence[int]],
+               xor_equations: Iterable[Sequence[int]]) -> None:
+    clauses, xor_equations = list(clauses), list(xor_equations)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="ascii", newline="\n") as stream:
+        stream.write(f"p cnf {num_vars} {len(clauses) + len(xor_equations)}\n")
+        for clause in clauses:
+            stream.write(" ".join(map(str, clause)) + " 0\n")
+        for equation in xor_equations:
+            stream.write("x" + str(equation[0]) + " "
+                         + " ".join(map(str, equation[1:])) + " 0\n")
 
-        # XOR = 1: exclude the four even-parity assignments
-        assignments = [
-            (0, 0, 0),
-            (0, 1, 1),
-            (1, 0, 1),
-            (1, 1, 0)
-        ]
 
-        for assignment in assignments:
-            clause = [
-                literal if bit == 0 else -literal
-                for literal, bit in zip(literals, assignment)
-            ]
+def generate_dataset(count: int, *, seed: int = 1, standard_dir: str | Path = DEFAULT_STANDARD_DIR,
+                     xor_dir: str | Path = DEFAULT_XOR_DIR, manifest: str | Path = DEFAULT_MANIFEST,
+                     round1_known_bits: int = 60, round10_known_bits: int = 60,
+                     formats: str = "both") -> list[dict]:
+    if count < 1:
+        raise ValueError("count must be positive")
+    rng = random.Random(seed)
+    records = []
+    for index in range(count):
+        key = bytes(rng.randrange(256) for _ in range(16))
+        instance = generate_aes128_cnf(key, round1_known_bits=round1_known_bits,
+                                       round10_known_bits=round10_known_bits)
+        name = f"aes128_{index:03d}.cnf"
+        if formats in ("standard", "both"):
+            write_dimacs(Path(standard_dir) / name, instance.num_vars, _standard_clauses(instance))
+        if formats in ("xor", "both"):
+            write_xcnf(Path(xor_dir) / name, instance.num_vars, instance.clauses,
+                       instance.xor_equations)
+        records.append({
+            "name": name,
+            "ground_truth_key_hex": key.hex(),
+            "num_vars": instance.num_vars,
+            "standard_clause_count": len(instance.clauses) + len(instance.xor_equations) * 4,
+            "xor_clause_count": len(instance.clauses) + len(instance.xor_equations),
+            "observed_bit_count": len(instance.observations),
+            "seed": seed,
+        })
+        print(f"Generated {name}: vars={instance.num_vars}, "
+              f"known_bits={len(instance.observations)}", flush=True)
+    manifest_path = Path(manifest)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps({"seed": seed, "datasets": records}, indent=2) + "\n",
+                             encoding="utf-8")
+    return records
 
-            cnfClause.append(
-                " ".join(map(str, clause)) + " 0\n"
-            )
 
-    # Update DIMACS header
-    cnfClause.insert(
-        0,
-        f'p cnf {varcounter - 1} {len(cnfClause)}\n'
-    )
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--count", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--round1-known-bits", type=int, default=60)
+    parser.add_argument("--round10-known-bits", type=int, default=60)
+    parser.add_argument("--format", choices=("standard", "xor", "both"), default="both")
+    parser.add_argument("--standard-dir", type=Path, default=DEFAULT_STANDARD_DIR)
+    parser.add_argument("--xor-dir", type=Path, default=DEFAULT_XOR_DIR)
+    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    args = parser.parse_args(argv)
+    generate_dataset(args.count, seed=args.seed, standard_dir=args.standard_dir,
+                     xor_dir=args.xor_dir, manifest=args.manifest,
+                     round1_known_bits=args.round1_known_bits,
+                     round10_known_bits=args.round10_known_bits, formats=args.format)
+    return 0
 
-    f = open(
-        "test/" + str(i) + " output.cnf",
-        'w',
-        newline='\n'
-    )
 
-    for x in cnfClause:
-        f.write(x)
-
-    f.close()
-
-    # for print solution of CNF
-    # f = open(str(i) + " solution.txt", 'w', newline='\n')
-    # f.write(Bkey)
-    # f.close()
-
-    # in case you don't need xor cnf de-comment the next line
-    # os.remove(str(i) + " outputXor.cnf")
-
-print("Done!")
+if __name__ == "__main__":
+    raise SystemExit(main())

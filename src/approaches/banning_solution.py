@@ -210,12 +210,19 @@ def banning_solution(input_file: str | Path, *, kissat: str | Path = DEFAULT_KIS
                      solution_dir: str | Path = DEFAULT_SOLUTION_DIR,
                      timing_dir: str | Path = DEFAULT_TIMING_DIR,
                      timeout: float | None = None, max_solutions: int | None = None,
-                     key_variables: Sequence[int] | None = None) -> EnumerationResult:
+                     key_variables: Sequence[int] | None = None,
+                     solver: str = "kissat", solver_path: str | Path | None = None,
+                     xor_format: bool = False, threads: int = 1) -> EnumerationResult:
     """Enumerate distinct AES-128 keys and persist machine-readable results."""
     input_file = Path(input_file).resolve()
     if not input_file.is_file():
         raise FileNotFoundError(input_file)
-    num_vars, original_clauses = read_cnf(input_file)
+    if xor_format:
+        from .common import read_problem
+        num_vars, original_clauses, xor_equations = read_problem(input_file, xor_format=True)
+    else:
+        num_vars, original_clauses = read_cnf(input_file)
+        xor_equations = []
     key_variables = list(key_variables or range(1, 129))
     if len(key_variables) != 128 or len(set(key_variables)) != 128:
         raise ValueError("Exactly 128 distinct key variable IDs are required")
@@ -240,10 +247,26 @@ def banning_solution(input_file: str | Path, *, kissat: str | Path = DEFAULT_KIS
     try:
         with solutions_path.open("w", encoding="utf-8", newline="\n") as output:
             while max_solutions is None or len(keys) < max_solutions:
-                write_cnf(working_file, num_vars, clauses)
-                solved = solve_with_kissat(working_file, kissat=kissat, timeout=timeout)
+                if xor_format:
+                    from .common import write_problem
+                    write_problem(working_file, num_vars, clauses, xor_equations,
+                                  xor_format=True)
+                else:
+                    write_cnf(working_file, num_vars, clauses)
+                print(f"  solver call {solver_calls + 1}: {len(keys)} distinct key(s) so far",
+                      flush=True)
+                if solver == "kissat" and not xor_format and solver_path is None:
+                    solved = solve_with_kissat(working_file, kissat=kissat, timeout=timeout)
+                else:
+                    from .common import solve_with_solver
+                    solved = solve_with_solver(working_file, solver=solver,
+                                               solver_path=solver_path or (kissat if solver == "kissat" else None),
+                                               timeout=timeout, xor_format=xor_format,
+                                               threads=threads)
                 solver_calls += 1
                 call_times.append(solved.elapsed_seconds)
+                print(f"  call {solver_calls}: {solved.status} in {solved.elapsed_seconds:.2f}s",
+                      flush=True)
                 if solved.status != "SAT":
                     status = solved.status
                     break
@@ -258,12 +281,16 @@ def banning_solution(input_file: str | Path, *, kissat: str | Path = DEFAULT_KIS
                     "solver_call_seconds": solved.elapsed_seconds,
                 }) + "\n")
                 output.flush()
+                print(f"  key {len(keys)}: {key_hex}", flush=True)
                 clauses.append(key_blocking_clause(solved.model, key_variables))
             else:
                 status = "LIMIT_REACHED"
     except Exception as exc:
         status = "ERROR"
         error = f"{type(exc).__name__}: {exc}"
+    except KeyboardInterrupt:
+        status = "INTERRUPTED"
+        error = "Interrupted by user; keys found so far are preserved."
     finally:
         elapsed = time.perf_counter() - started
         working_file.unlink(missing_ok=True)
@@ -276,7 +303,7 @@ def banning_solution(input_file: str | Path, *, kissat: str | Path = DEFAULT_KIS
     payload["max_solutions"] = max_solutions
     payload["key_variables"] = key_variables
     _write_json(timing_path, payload)
-    if error:
+    if error and status == "ERROR":
         raise RuntimeError(error)
     return result
 
@@ -287,13 +314,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--kissat", type=Path, default=DEFAULT_KISSAT, help="Kissat executable path")
     parser.add_argument("--timeout", type=float, default=None, help="Per-call timeout in seconds")
     parser.add_argument("--max-solutions", type=int, default=None, help="Stop after this many distinct keys")
+    parser.add_argument("--solver", choices=("kissat", "cryptominisat"), default="kissat")
+    parser.add_argument("--solver-path", type=Path)
+    parser.add_argument("--xor", action="store_true", help="input is CryptoMiniSat XOR-CNF")
+    parser.add_argument("--threads", type=int, default=1)
     args = parser.parse_args(argv)
     exit_code = 0
     for cnf in args.cnf:
         print(f"Banning Solution: {cnf}")
         try:
             result = banning_solution(cnf, kissat=args.kissat, timeout=args.timeout,
-                                      max_solutions=args.max_solutions)
+                                      max_solutions=args.max_solutions,
+                                      solver=args.solver, solver_path=args.solver_path,
+                                      xor_format=args.xor, threads=args.threads)
             print(f"status={result.status} keys={result.solution_count} calls={result.solver_calls} "
                   f"elapsed={result.elapsed_seconds:.3f}s")
             if result.error:
